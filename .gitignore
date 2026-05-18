@@ -1,0 +1,21 @@
+# Elixir / Mix
+/_build/
+/deps/
+*.ez
+*.beam
+*.plt
+erl_crash.dump
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Local data
+*.dets
+*.db
+/tmp/
+
+# Generated docs / artifacts
+/doc/
+/cover/
