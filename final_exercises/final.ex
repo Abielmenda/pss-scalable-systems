@@ -57,44 +57,100 @@ defmodule Final do
 
     def create_bank(name \\ nil) do
       options = if is_nil(name), do: [], else: [name: name]
-      GenServer.start_link(__MODULE__, %{}, options)
+      GenServer.start_link(__MODULE__, name, options)
     end
 
     def new_account(bank, account), do: GenServer.call(bank, {:new_account, account})
     def withdraw(bank, account, quantity), do: GenServer.call(bank, {:withdraw, account, quantity})
     def deposit(bank, account, quantity), do: GenServer.call(bank, {:deposit, account, quantity})
-    def transfer(bank, from_account, to_account, quantity), do: GenServer.call(bank, {:transfer, from_account, to_account, quantity})
+
+    def transfer(bank, from_account, to_account, quantity) do
+      GenServer.call(bank, {:transfer, from_account, to_account, quantity})
+    end
+
     def balance(bank, account), do: GenServer.call(bank, {:balance, account})
 
     @impl GenServer
-    def init(state), do: {:ok, state}
+    def init(nil) do
+      {:ok, %{accounts: %{}, table: nil}}
+    end
+
+    def init(name) when is_atom(name) do
+      table = dets_table(name)
+      file = dets_file(name)
+
+      {:ok, ^table} = :dets.open_file(table, file: String.to_charlist(file), type: :set)
+
+      accounts =
+        case :dets.lookup(table, :accounts) do
+          [{:accounts, saved_accounts}] -> saved_accounts
+          [] -> %{}
+        end
+
+      {:ok, %{accounts: accounts, table: table}}
+    end
 
     @impl GenServer
     def handle_call({:new_account, account}, _from, state) do
-      if Map.has_key?(state, account), do: {:reply, false, state}, else: {:reply, true, Map.put(state, account, 0)}
+      if Map.has_key?(state.accounts, account) do
+        {:reply, false, state}
+      else
+        new_state = %{state | accounts: Map.put(state.accounts, account, 0)} |> persist()
+        {:reply, true, new_state}
+      end
     end
 
-    def handle_call({:balance, account}, _from, state), do: {:reply, Map.get(state, account, 0), state}
+    def handle_call({:balance, account}, _from, state) do
+      {:reply, Map.get(state.accounts, account, 0), state}
+    end
 
     def handle_call({:deposit, account, quantity}, _from, state) do
-      new_balance = Map.get(state, account, 0) + quantity
-      {:reply, new_balance, Map.put(state, account, new_balance)}
+      new_balance = Map.get(state.accounts, account, 0) + quantity
+      new_state = %{state | accounts: Map.put(state.accounts, account, new_balance)} |> persist()
+      {:reply, new_balance, new_state}
     end
 
     def handle_call({:withdraw, account, quantity}, _from, state) do
-      current = Map.get(state, account, 0)
-      if quantity <= current, do: {:reply, quantity, Map.put(state, account, current - quantity)}, else: {:reply, 0, state}
-    end
+      current = Map.get(state.accounts, account, 0)
 
-    def handle_call({:transfer, from_account, to_account, quantity}, _from, state) do
-      from_balance = Map.get(state, from_account, 0)
-      if quantity <= from_balance do
-        new_state = state |> Map.put(from_account, from_balance - quantity) |> Map.put(to_account, Map.get(state, to_account, 0) + quantity)
+      if quantity <= current do
+        new_state = %{state | accounts: Map.put(state.accounts, account, current - quantity)} |> persist()
         {:reply, quantity, new_state}
       else
         {:reply, 0, state}
       end
     end
+
+    def handle_call({:transfer, from_account, to_account, quantity}, _from, state) do
+      from_balance = Map.get(state.accounts, from_account, 0)
+
+      if quantity <= from_balance do
+        new_accounts =
+          state.accounts
+          |> Map.put(from_account, from_balance - quantity)
+          |> Map.put(to_account, Map.get(state.accounts, to_account, 0) + quantity)
+
+        new_state = %{state | accounts: new_accounts} |> persist()
+        {:reply, quantity, new_state}
+      else
+        {:reply, 0, state}
+      end
+    end
+
+    @impl GenServer
+    def terminate(_reason, %{table: nil}), do: :ok
+    def terminate(_reason, %{table: table}), do: :dets.close(table)
+
+    defp persist(%{table: nil} = state), do: state
+
+    defp persist(%{table: table, accounts: accounts} = state) do
+      :ok = :dets.insert(table, {:accounts, accounts})
+      :ok = :dets.sync(table)
+      state
+    end
+
+    defp dets_table(name), do: String.to_atom("#{name}_accounts")
+    defp dets_file(name), do: "#{name}.dets"
   end
 
   defmodule SuperBank do
@@ -104,7 +160,15 @@ defmodule Final do
 
     @impl Supervisor
     def init(name) do
-      children = [%{id: Final.GenBank, start: {Final.GenBank, :create_bank, [name]}, restart: :permanent, type: :worker}]
+      children = [
+        %{
+          id: Final.GenBank,
+          start: {Final.GenBank, :create_bank, [name]},
+          restart: :permanent,
+          type: :worker
+        }
+      ]
+
       Supervisor.init(children, strategy: :one_for_one)
     end
   end
