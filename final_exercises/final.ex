@@ -72,22 +72,11 @@ defmodule Final do
 
     @impl GenServer
     def init(nil) do
-      {:ok, %{accounts: %{}, table: nil}}
+      {:ok, %{accounts: %{}, name: nil}}
     end
 
     def init(name) when is_atom(name) do
-      table = dets_table(name)
-      file = dets_file(name)
-
-      {:ok, ^table} = :dets.open_file(table, file: String.to_charlist(file), type: :set)
-
-      accounts =
-        case :dets.lookup(table, :accounts) do
-          [{:accounts, saved_accounts}] -> saved_accounts
-          [] -> %{}
-        end
-
-      {:ok, %{accounts: accounts, table: table}}
+      {:ok, %{accounts: read_accounts(name), name: name}}
     end
 
     @impl GenServer
@@ -137,19 +126,45 @@ defmodule Final do
       end
     end
 
-    @impl GenServer
-    def terminate(_reason, %{table: nil}), do: :ok
-    def terminate(_reason, %{table: table}), do: :dets.close(table)
+    defp persist(%{name: nil} = state), do: state
 
-    defp persist(%{table: nil} = state), do: state
-
-    defp persist(%{table: table, accounts: accounts} = state) do
-      :ok = :dets.insert(table, {:accounts, accounts})
-      :ok = :dets.sync(table)
+    defp persist(%{name: name, accounts: accounts} = state) do
+      write_accounts(name, accounts)
       state
     end
 
-    defp dets_table(name), do: String.to_atom("#{name}_accounts")
+    defp read_accounts(name) do
+      with_dets(name, fn table ->
+        case :dets.lookup(table, :accounts) do
+          [{:accounts, saved_accounts}] -> saved_accounts
+          [] -> %{}
+        end
+      end)
+    end
+
+    defp write_accounts(name, accounts) do
+      with_dets(name, fn table ->
+        :ok = :dets.insert(table, {:accounts, accounts})
+        :ok = :dets.sync(table)
+      end)
+    end
+
+    defp with_dets(name, fun) do
+      table = dets_table(name)
+      file = dets_file(name)
+      {:ok, ^table} = :dets.open_file(table, file: String.to_charlist(file), type: :set)
+
+      try do
+        fun.(table)
+      after
+        :dets.close(table)
+      end
+    end
+
+    defp dets_table(name) do
+      String.to_atom("#{name}_accounts_#{System.unique_integer([:positive])}")
+    end
+
     defp dets_file(name), do: "#{name}.dets"
   end
 
