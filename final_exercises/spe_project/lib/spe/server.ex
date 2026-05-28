@@ -32,13 +32,14 @@ defmodule SPE.Server do
   def handle_call({:submit_job, job_description}, _from, state) do
     case SPE.Validator.validate_job(job_description) do
       {:ok, parsed_job} ->
-        job_id = state.next_job_id
+        next_job_id = state.next_job_id
+        job_id = Integer.to_string(next_job_id)
         job = %{id: job_id, description: parsed_job, status: :submitted, runner: nil}
 
         next_state =
           state
           |> Map.put(:jobs, Map.put(state.jobs, job_id, job))
-          |> Map.put(:next_job_id, job_id + 1)
+          |> Map.put(:next_job_id, next_job_id + 1)
 
         {:reply, {:ok, job_id}, next_state}
 
