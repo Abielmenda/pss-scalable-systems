@@ -5,12 +5,6 @@ defmodule SPE.Server do
 
   use GenServer
 
-  defstruct num_workers: :unbounded,
-            jobs: %{},
-            next_job_id: 1,
-            running_tasks: 0,
-            queue: []
-
   def start_link(options \\ []) do
     GenServer.start_link(__MODULE__, options, name: __MODULE__)
   end
@@ -25,8 +19,10 @@ defmodule SPE.Server do
 
   @impl true
   def init(options) do
-    state = %__MODULE__{
-      num_workers: Keyword.get(options, :num_workers, :unbounded)
+    state = %{
+      num_workers: Keyword.get(options, :num_workers, :unbounded),
+      jobs: %{},
+      next_job_id: 1
     }
 
     {:ok, state}
@@ -37,13 +33,12 @@ defmodule SPE.Server do
     case SPE.Validator.validate_job(job_description) do
       {:ok, parsed_job} ->
         job_id = state.next_job_id
-        job = %{id: job_id, description: parsed_job, status: :pending, runner: nil}
+        job = %{id: job_id, description: parsed_job, status: :submitted, runner: nil}
 
-        next_state = %{
+        next_state =
           state
-          | jobs: Map.put(state.jobs, job_id, job),
-            next_job_id: job_id + 1
-        }
+          |> Map.put(:jobs, Map.put(state.jobs, job_id, job))
+          |> Map.put(:next_job_id, job_id + 1)
 
         {:reply, {:ok, job_id}, next_state}
 
@@ -57,15 +52,18 @@ defmodule SPE.Server do
       :error ->
         {:reply, {:error, :unknown_job}, state}
 
-      {:ok, %{status: status}} when status != :pending ->
-        {:reply, {:error, :already_started}, state}
+      {:ok, %{status: status}} when status != :submitted ->
+        reply =
+          case status do
+            :running -> {:error, :already_started}
+            :finished -> {:error, :already_finished}
+            _other -> {:error, :already_started}
+          end
+
+        {:reply, reply, state}
 
       {:ok, job} ->
-        case SPE.JobRunner.start_link(
-               job: job.description,
-               num_workers: state.num_workers,
-               job_id: job_id
-             ) do
+        case SPE.JobRunner.start(job_id, job.description.tasks, SPE.PubSub, state.num_workers) do
           {:ok, pid} ->
             updated_job = %{job | status: :running, runner: pid}
             next_state = %{state | jobs: Map.put(state.jobs, job_id, updated_job)}

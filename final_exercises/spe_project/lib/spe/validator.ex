@@ -4,9 +4,10 @@ defmodule SPE.Validator do
   """
 
   def validate_job(%{"name" => name, "tasks" => tasks})
-      when is_binary(name) and byte_size(name) > 0 and is_list(tasks) do
-    with {:ok, parsed_tasks} <- validate_tasks(tasks) do
-      {:ok, %{"name" => name, "tasks" => parsed_tasks}}
+      when is_binary(name) and byte_size(name) > 0 and is_list(tasks) and tasks != [] do
+    with {:ok, parsed_tasks} <- validate_tasks(tasks),
+         :ok <- validate_enabled_tasks_exist(parsed_tasks) do
+      {:ok, %{name: name, tasks: parsed_tasks}}
     end
   end
 
@@ -23,8 +24,8 @@ defmodule SPE.Validator do
 
   defp validate_task(task, {:ok, parsed_tasks, names}) when is_map(task) do
     with {:ok, parsed_task} <- parse_task(task),
-         :ok <- reject_duplicate_task_name(parsed_task["name"], names) do
-      {:cont, {:ok, [parsed_task | parsed_tasks], MapSet.put(names, parsed_task["name"])}}
+         :ok <- reject_duplicate_task_name(parsed_task.name, names) do
+      {:cont, {:ok, [parsed_task | parsed_tasks], MapSet.put(names, parsed_task.name)}}
     else
       {:error, reason} -> {:halt, {:error, reason}}
     end
@@ -41,17 +42,24 @@ defmodule SPE.Validator do
          :ok <- validate_timeout(timeout) do
       {:ok,
        %{
-         "name" => name,
-         "exec" => exec,
-         "enables" => enables,
-         "timeout" => timeout
+         name: name,
+         exec: exec,
+         enables: enables,
+         timeout: timeout
        }}
     end
   end
 
   defp parse_task(_task), do: {:error, :invalid_task}
 
-  defp validate_enables(enables) when is_list(enables), do: :ok
+  defp validate_enables(enables) when is_list(enables) do
+    if Enum.all?(enables, &is_binary/1) do
+      :ok
+    else
+      {:error, :invalid_task_enables}
+    end
+  end
+
   defp validate_enables(_enables), do: {:error, :invalid_task_enables}
 
   defp validate_timeout(:infinity), do: :ok
@@ -61,6 +69,21 @@ defmodule SPE.Validator do
   defp reject_duplicate_task_name(name, names) do
     if MapSet.member?(names, name) do
       {:error, :duplicate_task_name}
+    else
+      :ok
+    end
+  end
+
+  defp validate_enabled_tasks_exist(tasks) do
+    task_names = MapSet.new(tasks, & &1.name)
+
+    unknown_enabled_task =
+      tasks
+      |> Enum.flat_map(& &1.enables)
+      |> Enum.find(&(not MapSet.member?(task_names, &1)))
+
+    if unknown_enabled_task do
+      {:error, :unknown_enabled_task}
     else
       :ok
     end

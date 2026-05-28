@@ -1,11 +1,11 @@
 # SPE
 
-SPE (Job Processing Engine) is a small Elixir/OTP job processing engine scaffold
-for the Programming Scalable Systems final project.
+SPE (Job Processing Engine) is an Elixir/OTP job processing engine for the
+Programming Scalable Systems final project.
 
-The current version sets up the base Mix project, public API, supervisor tree,
-job validation, and basic job lifecycle state. It does not yet execute the full
-DAG of tasks, enforce dependencies, publish events, or manage worker scheduling.
+The current version implements the base layer of the system: public API,
+supervisor tree, server state, job validation, and initial job lifecycle
+management.
 
 ## Install dependencies
 
@@ -28,6 +28,6 @@ mix test
 
 ## Current status
 
-This is the initial scaffold. The complete DAG execution engine, task workers,
-timeouts, dependency handling, and Phoenix PubSub notifications are intentionally
-left for later implementation steps.
+The base API and validation layer are implemented. Real task execution, DAG
+scheduling, worker control, timeout handling, crash handling, and execution
+events remain pending integration through `SPE.JobRunner`.
