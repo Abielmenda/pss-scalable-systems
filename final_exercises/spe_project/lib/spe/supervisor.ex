@@ -27,11 +27,11 @@ defmodule SPE.Supervisor do
   def init(options) do
     children = [
       {Phoenix.PubSub, name: SPE.PubSub},
-      {DynamicSupervisor, strategy: :one_for_one, name: SPE.JobSupervisor},
+      {DynamicSupervisor, strategy: :one_for_all, name: SPE.JobSupervisor},
       {SPE.WorkerPool, options},
       {SPE.Server, options}
     ]
 
-    Supervisor.init(children, strategy: :one_for_one)
+    Supervisor.init(children, strategy: :one_for_all)
   end
 end
