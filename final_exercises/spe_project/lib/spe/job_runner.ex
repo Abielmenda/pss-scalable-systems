@@ -1,194 +1,173 @@
 defmodule SPE.JobRunner do
+  @moduledoc """
+  Coordinates task execution for a single job.
+  """
+
   use GenServer
-  require Logger
-  alias SPE.{Job, TaskRunner}
-  # estructura para el estado del jobrunner con resultados de las tareas, tareas ejecutando, listas, esperando o completadas
-  defstruct job: nil,
-            server_pid: nil,
-            results: %{},
-            running: %{},
-            ready: [],
-            waiting: %{},
-            completadas: []
-  def start_link(options \\ []) do
+
+  def start(job_id, parsed_tasks, pubsub_name, _num_workers) do
+    child = {__MODULE__, job_id: job_id, tasks: parsed_tasks, pubsub_name: pubsub_name}
+    DynamicSupervisor.start_child(SPE.JobSupervisor, child)
+  end
+
+  def start_link(options) do
     GenServer.start_link(__MODULE__, options)
   end
 
   @impl true
   def init(options) do
-    job = Keyword.fetch!(options, :job)
-    server_pid = Keyword.fetch!(options, :server_pid)
-    # empiezan las tareas sin dependencias
-    listas_inicio = Job.task_nodep(job)
-    # las que tienen esperan
-    esperando_inicio = dep_waiting(job)
-    state = %__MODULE__{
-      job: job,
-      server_pid: server_pid,
-      ready: listas_inicio,
-      waiting: esperando_inicio
-    }
-    # peticion de los slots para las tareas iniciales
-    send(self(), :pedir_slots_iniciales)
+    tasks = Keyword.fetch!(options, :tasks)
 
-    {:ok, state}
+    state = %{
+      job_id: Keyword.fetch!(options, :job_id),
+      pubsub_name: Keyword.fetch!(options, :pubsub_name),
+      tasks: Map.new(tasks, &{&1.name, &1}),
+      dependencies: dependencies(tasks),
+      dependents: dependents(tasks),
+      transitive_dependencies: transitive_dependencies(tasks),
+      results: %{},
+      running: MapSet.new(),
+      finished?: false
+    }
+
+    {:ok, state, {:continue, :schedule}}
   end
-  # se pide al Server un slot por cada tarea lista para ejecutar
+
   @impl true
-  def handle_info(:pedir_slots_iniciales, state) do
-    pedir_slots(length(state.ready), state.server_pid)
+  def handle_continue(:schedule, state) do
+    {:noreply, schedule_ready_tasks(state)}
+  end
+
+  @impl true
+  def handle_info({:task_finished, task_name, result}, state) do
+    state =
+      state
+      |> put_task_result(task_name, result)
+      |> mark_blocked_tasks(task_name, result)
+      |> schedule_ready_tasks()
+      |> maybe_finish_job()
+
     {:noreply, state}
   end
-  # si Server nos ha concedido un slot, se ejecuta la primera tarea de la cola
-  def handle_info({:slot_granted, ref}, state) do
-    case state.ready do
-      [] ->
-        # en caso de no tener tareas esperando slot, se devuelve
-        send(state.server_pid, {:release_slot, ref})
-        {:noreply, state}
-      [nombre | resto] ->
-        tarea = state.job.tasks[nombre]
-        # resultados de sus dependencias para pasarlos a exec
-        resultados_deps = recoger_resultados_deps(nombre, state)
-        Logger.debug("[SPE] Job #{state.job.id} — lanzando tarea: #{nombre}")
-        TaskRunner.run(state.job.id, tarea, resultados_deps, self())
-        nuevo_state = %{state |
-          ready:   resto,
-          running: Map.put(state.running, nombre, ref)
-        }
-        {:noreply, nuevo_state}
-    end
-  end
-  # tarea terminada, avisa el task runner
-  def handle_info({:task_done, nombre, resultado}, state) do
-    Logger.debug("[SPE] Job #{state.job.id} — tarea #{nombre} terminó: #{inspect(resultado)}")
-    # se libeera el slot que usaba esta tarea
-    {ref, nuevo_running} = Map.pop(state.running, nombre)
-    if ref != nil, do: send(state.server_pid, {:release_slot, ref})
-    # resultado tarea
-    nuevo_results = Map.put(state.results, nombre, resultado)
-    state_actualizado = %{state | results: nuevo_results, running: nuevo_running}
-    nuevo_state =
-      case resultado do
-        {:result, _} ->
-          # las tarea termino con exito, hay que desbloquear las tareas que dependian de esta
-          procesar_tarea_exito(nombre, state_actualizado)
 
-        _ ->
-          # hay fallo, marcar como :not_run todo lo que dependia de esta tarea
-          procesar_tarea_fail(nombre, state_actualizado)
-      end
-
-    # si no quedan tareas ni ejecutándose, ni listas, ni esperando, el trabajo termina
-    if job_terminado?(nuevo_state) do
-      publicar_resultado_final(nuevo_state)
-    end
-
-    {:noreply, nuevo_state}
-  end
-  defp procesar_tarea_exito(nombre, state) do
-    # se añade a la lista de completadas
-    nuevas_completadas = [nombre | state.completadas]
-    # hay que calcular tareas que se desbloquean ahora que esta ha terminado
-    recien_desbloqueadas = Job.task_desbloq(state.job, nombre, nuevas_completadas)
-    # pasan de waiting a ready
-    nuevo_waiting = Map.drop(state.waiting, recien_desbloqueadas)
-    nuevo_ready   = state.ready ++ recien_desbloqueadas
-    # hay que pedir un slot por cada tarea recién desbloqueada
-    pedir_slots(length(recien_desbloqueadas), state.server_pid)
-    %{state |
-      completadas: nuevas_completadas,
-      waiting:     nuevo_waiting,
-      ready:       nuevo_ready
+  defp put_task_result(state, task_name, result) do
+    %{
+      state
+      | results: Map.put(state.results, task_name, result),
+        running: MapSet.delete(state.running, task_name)
     }
   end
-  defp procesar_tarea_fail(nombre, state) do
-    # hay que buscar todas los que dependen de esta tarea
-    bloqueadas = buscar_dependientes_trans(state.job, nombre)
-    # se eliminan del mapa de espera porque nunca podrán ejecutarse
-    nuevo_waiting = Map.drop(state.waiting, bloqueadas)
-    # marcadas como :not_run en los resultados
-    not_run_map = Map.new(bloqueadas, fn nombre_bloqueada ->
-      {nombre_bloqueada, :not_run}
+
+  defp mark_blocked_tasks(state, _task_name, {:result, _value}), do: state
+
+  defp mark_blocked_tasks(state, task_name, _failed_result) do
+    task_name
+    |> descendants(state.dependents)
+    |> Enum.reject(&Map.has_key?(state.results, &1))
+    |> Enum.reduce(state, fn blocked_task, acc ->
+      %{acc | results: Map.put(acc.results, blocked_task, :not_run)}
     end)
-    nuevo_results = Map.merge(state.results, not_run_map)
-    %{state | waiting: nuevo_waiting, results: nuevo_results}
   end
-  # aux para tareas que esperan al principio
-  defp dep_waiting(job) do
-    job.dependencias
-    |> Enum.reject(fn {_nombre, deps} -> deps == [] end)
-    |> Map.new()
+
+  defp schedule_ready_tasks(%{finished?: true} = state), do: state
+
+  defp schedule_ready_tasks(state) do
+    ready_tasks =
+      state.tasks
+      |> Map.values()
+      |> Enum.filter(&ready?(&1, state))
+
+    Enum.each(ready_tasks, fn task ->
+      task_dependencies = dependency_results(task.name, state)
+      SPE.WorkerPool.run(self(), state.job_id, task, task_dependencies, state.pubsub_name)
+    end)
+
+    Enum.reduce(ready_tasks, state, fn task, acc ->
+      %{acc | running: MapSet.put(acc.running, task.name)}
+    end)
   end
-  # aux para enviar peticiones de slot al Server (una por tarea que queremos ejecutar)
-  defp pedir_slots(0, _server_pid), do: :ok
-  defp pedir_slots(n, server_pid) do
-    send(server_pid, {:request_slot, self()})
-    pedir_slots(n - 1, server_pid)
+
+  defp ready?(task, state) do
+    not Map.has_key?(state.results, task.name) and
+      not MapSet.member?(state.running, task.name) and
+      Enum.all?(Map.fetch!(state.dependencies, task.name), fn dependency ->
+        match?({:result, _value}, Map.get(state.results, dependency))
+      end)
   end
-  # aux para coger resultados de dependecias de tarea para ejecutar
-  defp recoger_resultados_deps(nombre_tarea, state) do
-    deps_transitivas = all_deps(state.job, nombre_tarea)
-    Enum.reduce(deps_transitivas, %{}, fn dep, acc ->
-      case Map.get(state.results, dep) do
-        # solo se incluyen las deps que terminaron con éxito
-        {:result, valor} -> Map.put(acc, dep, valor)
-        _  -> acc
+
+  defp dependency_results(task_name, state) do
+    state.transitive_dependencies
+    |> Map.fetch!(task_name)
+    |> Enum.reduce(%{}, fn dependency, acc ->
+      case Map.fetch!(state.results, dependency) do
+        {:result, value} -> Map.put(acc, dependency, value)
       end
     end)
   end
-  # aux para buscar en el grafo todas las dependencias
-  defp all_deps(job, nombre_tarea) do
-    buscar_deps(job.dependencias, [nombre_tarea], [])
-    |> Enum.reject(fn d -> d == nombre_tarea end)
-  end
-  # busco las dependencias por medio de busqueda en anchura en el grafo
-  defp buscar_deps(_deps, [], visitados), do: visitados
-  defp buscar_deps(deps, [actual | resto], visitados) do
-    if actual in visitados do
-      # nodo visitado se salta
-      buscar_deps(deps, resto, visitados)
+
+  defp maybe_finish_job(%{finished?: true} = state), do: state
+
+  defp maybe_finish_job(state) do
+    if map_size(state.results) == map_size(state.tasks) do
+      status =
+        if Enum.all?(state.results, fn {_task_name, result} -> match?({:result, _}, result) end) do
+          :succeeded
+        else
+          :failed
+        end
+
+      broadcast(state.pubsub_name, state.job_id, {state.job_id, :result, {status, state.results}})
+      %{state | finished?: true}
     else
-      vecinos = Map.get(deps, actual, [])
-      buscar_deps(deps, resto ++ vecinos, [actual | visitados])
+      state
     end
   end
-  # aux para buscar depencias transitivas para tarea fallida
-  defp dependientes_transitivos(job, nombre_fallida) do
-    sucesores_directos = Map.get(job.desbloqueos, nombre_fallida, [])
-    busqueda_desbloqueos(job.desbloqueos, sucesores_directos, [])
-  end
-  defp busqueda_desbloqueos(_desbloqueos, [], visitados), do: visitados
-  defp busqueda_desbloqueos(desbloqueos, [actual | resto], visitados) do
-    if actual in visitados do
-      busqueda_desbloqueos(desbloqueos, resto, visitados)
-    else
-      hijos = Map.get(enables, actual, [])
-      busqueda_desbloqueos(desbloqueos, resto ++ hijos, [actual | visitados])
-    end
-  end
-  # aux para comprobar que el job ha terminado, cuando no hay nada ejecutando, listo, ni esperando
-  defp job_terminado?(state) do
-    map_size(state.running) == 0 and state.ready == [] and map_size(state.waiting) == 0
-  end
-  # publicacion del resultado final en el pubsub
-  defp publicar_resultado_final(state) do
-    job_id = state.job.id
-    tiempo = :erlang.monotonic_time(:millisecond)
-    # job falla si alguna tarea devolvió {:failed, _}
-    hay_fallo = Enum.any?(state.results, fn {_nombre, resultado} ->
-      case resultado do
-        {:failed, _} -> true
-        _            -> false
-      end
+
+  defp dependencies(tasks) do
+    base = Map.new(tasks, &{&1.name, []})
+
+    Enum.reduce(tasks, base, fn task, acc ->
+      Enum.reduce(task.enables, acc, fn enabled_task, inner_acc ->
+        Map.update!(inner_acc, enabled_task, &[task.name | &1])
+      end)
     end)
-    status = if hay_fallo, do: :failed, else: :succeeded
+  end
+
+  defp dependents(tasks) do
+    Map.new(tasks, &{&1.name, &1.enables})
+  end
+
+  defp transitive_dependencies(tasks) do
+    direct_dependencies = dependencies(tasks)
+
+    Map.new(tasks, fn task ->
+      {task.name, all_dependencies(task.name, direct_dependencies)}
+    end)
+  end
+
+  defp all_dependencies(task_name, direct_dependencies) do
+    direct_dependencies
+    |> Map.fetch!(task_name)
+    |> Enum.flat_map(fn dependency ->
+      [dependency | all_dependencies(dependency, direct_dependencies)]
+    end)
+    |> Enum.uniq()
+  end
+
+  defp descendants(task_name, dependents) do
+    dependents
+    |> Map.fetch!(task_name)
+    |> Enum.flat_map(fn dependent ->
+      [dependent | descendants(dependent, dependents)]
+    end)
+    |> Enum.uniq()
+  end
+
+  defp broadcast(pubsub_name, job_id, message) do
     Phoenix.PubSub.local_broadcast(
-      SPE.PubSub,
-      to_string(job_id),
-      {:spe, tiempo, {job_id, :result, {status, state.results}}}
+      pubsub_name,
+      job_id,
+      {:spe, :erlang.monotonic_time(:millisecond), message}
     )
-    Logger.info("[SPE] Job #{job_id} finalizado — estado: #{status}")
   end
 end
-
